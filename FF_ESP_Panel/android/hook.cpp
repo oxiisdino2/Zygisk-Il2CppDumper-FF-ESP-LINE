@@ -8,8 +8,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dlfcn.h>
+#include <android/log.h>
 #include <vector>
 #include <string>
+#define LOG_TAG "FF_ESP_Hook"
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 #define PLAYER_ISDEAD          0x50
 #define PLAYER_TEAMID          0x29C
@@ -122,6 +125,9 @@ void init_il2cpp_api() {
     il2cpp_class_from_name = (decltype(il2cpp_class_from_name))dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
     il2cpp_class_get_field_from_name = (decltype(il2cpp_class_get_field_from_name))dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
     il2cpp_field_static_get_value = (decltype(il2cpp_field_static_get_value))dlsym(RTLD_DEFAULT, "il2cpp_field_static_get_value");
+    LOGD("dlsym: il2cpp_class_from_name=%p", il2cpp_class_from_name);
+    LOGD("dlsym: il2cpp_class_get_field_from_name=%p", il2cpp_class_get_field_from_name);
+    LOGD("dlsym: il2cpp_field_static_get_value=%p", il2cpp_field_static_get_value);
 }
 
 void* get_static_field_value(const char* ns, const char* cls, const char* field) {
@@ -141,46 +147,131 @@ void scan_players_via_api() {
 
     // Get BaseGame.sAllEntities dictionary
     void* dict = get_static_field_value("GCommon", "BaseGame", "sAllEntities");
+    LOGD("scan_api: dict=0x%p", dict);
     if (!dict) {
-        // Fallback: try to get local player via GameFacade
+        LOGD("scan_api: sAllEntities not found via API, trying fallback");
         void* localPlayer = get_static_field_value("COW", "GameFacade", "LocalPlayerUserID");
-        // LocalPlayerUserID is a string, not a Player pointer. Try scanning instead.
+        LOGD("scan_api: LocalPlayerUserID=0x%p", localPlayer);
         return;
     }
 
-    // dict is Dictionary<uint, Entity>*
-    // Read its internal entries array and count
-    // On 32-bit: header(8) + _buckets(4) + _entries(4) + _count(4) = entries at +12, count at +16
-    // On 64-bit: header(16) + _buckets(8) + _entries(8) + _count(4) = entries at +24, count at +28
-    
     uint32_t is32bit = (sizeof(void*) == 4);
     int entriesOff = is32bit ? 12 : 24;
     int countOff   = is32bit ? 16 : 28;
 
     void* entriesPtr = *(void**)((uintptr_t)dict + entriesOff);
     int count = *(int*)((uintptr_t)dict + countOff);
+    LOGD("scan_api: entriesPtr=0x%p count=%d", entriesPtr, count);
     if (!entriesPtr || count <= 0 || count > 200) return;
 
-    // Entry struct: { int hashCode(4), int next(4), uint key(4), void* value(4/8) }
     int entrySize = is32bit ? 16 : 24;
     int valueOff = is32bit ? 12 : 16;
 
+    int found = 0;
     for (int i = 0; i < count; i++) {
         uintptr_t entry = (uintptr_t)entriesPtr + (uintptr_t)(i * entrySize);
         void* entity = *(void**)(entry + valueOff);
         if (!entity) continue;
         try_read_player(entity);
+        found++;
     }
+    LOGD("scan_api: found %d players from %d entries", (int)g_players.size(), found);
+}
+
+uintptr_t get_libil2cpp_base() {
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) { LOGD("get_base: failed to open maps"); return 0; }
+    char line[512];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), maps)) {
+        if (strstr(line, "libil2cpp.so")) { base = strtoul(line, nullptr, 16); break; }
+    }
+    fclose(maps);
+    LOGD("libil2cpp base: 0x%lx", base);
+    return base;
+}
+
+// Find MethodInfo by scanning data section for pointer to function RVA
+void* find_method_info() {
+    uintptr_t base = get_libil2cpp_base();
+    if (!base) { LOGD("find_method_info: no base"); return nullptr; }
+
+    uintptr_t funcAddr = base + 0x5F52F04;
+    LOGD("find_method_info: searching for funcAddr=0x%lx", funcAddr);
+    void* result = nullptr;
+    int scanned = 0;
+
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) { LOGD("find_method_info: cannot open maps"); return nullptr; }
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t start, end;
+        char perms[8] = {}, path[256] = {};
+        sscanf(line, "%lx-%lx %s %*lx %*s %*d %[^\n]", &start, &end, perms, path);
+        if (!strstr(path, "libil2cpp.so")) continue;
+        if (perms[0]!='r' || perms[1]!='w') continue;
+
+        for (uintptr_t addr = start; addr + 16 <= end; addr += 8) {
+            scanned++;
+            if (*(uintptr_t*)addr == funcAddr) {
+                result = (void*)addr;
+                LOGD("find_method_info: FOUND at 0x%lx (scanned %d)", addr, scanned);
+                break;
+            }
+        }
+        if (result) break;
+    }
+    fclose(maps);
+    LOGD("find_method_info: result=%p scanned=%d", result, scanned);
+    return result;
 }
 
 void* collector_thread(void*) {
+    LOGD("collector_thread: started");
     init_il2cpp_api();
+    LOGD("collector_thread: waiting 5s for Il2Cpp init");
     sleep(5);
-    for (int i = 0; i < 300; i++) {
+
+    // Try Il2Cpp API first
+    bool apiWorked = false;
+    for (int i = 0; i < 10; i++) {
+        LOGD("collector_thread: API scan attempt %d/10", i+1);
         scan_players_via_api();
-        if (!g_players.empty()) { sleep(3); continue; }
+        if (!g_players.empty()) {
+            LOGD("collector_thread: API scan found %zu players!", g_players.size());
+            apiWorked = true; break;
+        }
         sleep(1);
     }
+
+    // If API didn't work, try MethodInfo scanning + direct call
+    if (!apiWorked) {
+        LOGD("collector_thread: API failed, trying MethodInfo fallback");
+        void* methodInfo = find_method_info();
+        LOGD("collector_thread: MethodInfo=%p", methodInfo);
+        if (methodInfo) {
+            typedef void* (*func_t)(const void*);
+            func_t fn = (func_t)(get_libil2cpp_base() + 0x5F52F04);
+            LOGD("collector_thread: calling CurrentLocalPlayer with methodInfo");
+            for (int i = 0; i < 300; i++) {
+                g_players.clear();
+                void* localPlayer = fn(methodInfo);
+                if (localPlayer) {
+                    LOGD("collector_thread: got localPlayer=0x%p", localPlayer);
+                    try_read_player(localPlayer);
+                    pthread_mutex_lock(&g_data_mutex);
+                    for (auto& p : g_players) p.isLocal = true;
+                    pthread_mutex_unlock(&g_data_mutex);
+                }
+                if (!g_players.empty()) { sleep(3); continue; }
+                if (i < 10 || i % 50 == 0) LOGD("collector_thread: iteration %d, players=%zu", i, g_players.size());
+                sleep(1);
+            }
+        } else {
+            LOGD("collector_thread: MethodInfo not found, no fallback available");
+        }
+    }
+    LOGD("collector_thread: exiting, total players=%zu", g_players.size());
     return nullptr;
 }
 
