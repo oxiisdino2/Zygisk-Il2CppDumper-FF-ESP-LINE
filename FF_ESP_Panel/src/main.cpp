@@ -87,7 +87,8 @@ void RenderLoop() {
         g_esp.BeginFrame();
         {
             std::lock_guard<std::mutex> lock(g_playerMutex);
-            g_esp.Render(g_players, g_overlay.GetConfig());
+            bool connected = g_memory.IsConnected();
+            g_esp.Render(g_players, g_overlay.GetConfig(), connected);
         }
         g_esp.EndFrame();
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -105,25 +106,63 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 )";
 
     if (!g_memory.Connect()) {
-        std::cout << "[!] Connection failed. Make sure:\n";
-        std::cout << "  1. Bluestacks/MSI Emulator is running\n";
-        std::cout << "  2. Free Fire is open\n";
-        std::cout << "  3. The Zygisk hook module is installed\n";
-        system("pause");
-        return 1;
+        std::cout << "[!] ADB auto-detect failed.\n";
+        std::cout << "Enter the full path to adb.exe/HD-Adb.exe (or leave blank to exit):\n> ";
+        std::string customPath;
+        std::getline(std::cin, customPath);
+        if (!customPath.empty()) {
+            g_memory.SetADBPath(customPath);
+            if (!g_memory.Connect()) {
+                std::cout << "[!] Still failed.\n";
+                system("pause");
+                return 1;
+            }
+        } else {
+            std::cout << "[!] Make sure:\n";
+            std::cout << "  1. Bluestacks/MSI Emulator is running\n";
+            std::cout << "  2. Free Fire is open\n";
+            std::cout << "  3. The Zygisk hook module is installed\n";
+            system("pause");
+            return 1;
+        }
     }
 
     HWND targetWnd = nullptr;
-    const char* windows[] = {
+    const char* classNames[] = {
         "BlueStacksApp", "BSever_BstKey1", "Qt5QWindowIcon",
-        "MSIEmulatorWindow", nullptr
+        "QWidget", "MainWindowWindow", "WindowsForms10.Window.8.app.0.141b42a_r11_ad1",
+        "MSIEmulatorWindow", "Window_8_App_0_141b42a_r11_ad1",
+        nullptr
     };
-    for (int i = 0; windows[i]; i++) {
-        targetWnd = FindWindowA(windows[i], nullptr);
+    for (int i = 0; classNames[i]; i++) {
+        targetWnd = FindWindowA(classNames[i], nullptr);
         if (targetWnd) break;
     }
     if (!targetWnd) {
+        // Try finding by window title
+        const char* titles[] = {
+            "BlueStacks", "BlueStacks App Player", "MSI App Player",
+            "Free Fire", nullptr
+        };
+        for (int i = 0; titles[i]; i++) {
+            targetWnd = FindWindowA(nullptr, titles[i]);
+            if (targetWnd) break;
+        }
+    }
+    if (!targetWnd) {
         std::cout << "[!] Emulator window not found.\n";
+        std::cout << "[!] Listing visible windows for debugging:\n";
+        EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+            if (!IsWindowVisible(hwnd)) return TRUE;
+            char cls[128] = {}, title[256] = {};
+            GetClassNameA(hwnd, cls, sizeof(cls));
+            GetWindowTextA(hwnd, title, sizeof(title));
+            if (strlen(title) > 0)
+                std::cout << "  class='" << cls << "' title='" << title << "'\n";
+            return TRUE;
+        }, 0);
+        std::cout << "[!] Make sure Bluestacks/MSI Emulator is open.\n";
+        system("pause");
         return 1;
     }
 

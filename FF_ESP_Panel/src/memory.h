@@ -15,6 +15,7 @@ public:
     bool Connect();
     void Disconnect();
     bool IsConnected() const { return m_connected; }
+    void SetADBPath(const std::string& path) { m_adbPath = path; }
 
     bool StartSocketForward();
     std::string ExecuteADB(const std::string& cmd);

@@ -91,22 +91,32 @@ void ESPRenderer::EndFrame() {
     }
 }
 
-void ESPRenderer::Render(const std::vector<PlayerInfo>& players, const ESPConfig& config) {
-    if (!m_renderTarget || players.empty()) return;
+void ESPRenderer::Render(const std::vector<PlayerInfo>& players, const ESPConfig& config, bool connected) {
+    if (!m_renderTarget) return;
+
+    if (!connected) {
+        DrawStatus("Waiting for hook module...");
+        return;
+    }
+
+    if (players.empty()) {
+        DrawStatus("Connected - no players found");
+        return;
+    }
 
     for (const auto& p : players) {
         if (p.isDead) continue;
-        if (p.isLocalPlayer) continue;
         if (!p.onScreen) continue;
 
-        bool isEnemy = (p.teamIndex != players[0].teamIndex);
+        bool isEnemy = !p.isLocalPlayer && (p.teamIndex != players[0].teamIndex);
+        bool isLocal = p.isLocalPlayer;
 
         if (config.snaplines)
-            DrawSnapline(p.screenPos, config, isEnemy);
+            DrawSnapline(p.screenPos, config, isEnemy, isLocal);
         if (config.boxes)
-            DrawBox(p.screenPos, p.screenHeadPos, config, isEnemy);
+            DrawBox(p.screenPos, p.screenHeadPos, config, isEnemy, isLocal);
         if (config.names && !p.nickName.empty())
-            DrawName(p.nickName, p.screenHeadPos);
+            DrawName(p.nickName, p.screenHeadPos, isLocal);
         if (config.health)
             DrawHealthBar(p.screenPos, p.screenHeadPos, p.curHP, p.maxHP);
         if (config.distance)
@@ -114,10 +124,11 @@ void ESPRenderer::Render(const std::vector<PlayerInfo>& players, const ESPConfig
     }
 }
 
-void ESPRenderer::DrawSnapline(const Vector2& footPos, const ESPConfig& config, bool isEnemy) {
-    D2D1_COLOR_F color = isEnemy
-        ? D2D1::ColorF(1, 0, 0, 0.8f)
-        : D2D1::ColorF(0, 1, 0, 0.8f);
+void ESPRenderer::DrawSnapline(const Vector2& footPos, const ESPConfig& config, bool isEnemy, bool isLocal) {
+    D2D1_COLOR_F color;
+    if (isLocal) color = D2D1::ColorF(0, 1, 1, 0.8f);
+    else if (isEnemy) color = D2D1::ColorF(1, 0, 0, 0.8f);
+    else color = D2D1::ColorF(0, 1, 0, 0.8f);
     m_brush->SetColor(color);
     m_renderTarget->DrawLine(
         D2D1::Point2F((float)m_screenWidth / 2.0f, (float)m_screenHeight),
@@ -126,10 +137,11 @@ void ESPRenderer::DrawSnapline(const Vector2& footPos, const ESPConfig& config, 
 }
 
 void ESPRenderer::DrawBox(const Vector2& footPos, const Vector2& headPos,
-                          const ESPConfig& config, bool isEnemy) {
-    D2D1_COLOR_F color = isEnemy
-        ? D2D1::ColorF(1, 0, 0, 0.8f)
-        : D2D1::ColorF(0, 1, 0, 0.8f);
+                          const ESPConfig& config, bool isEnemy, bool isLocal) {
+    D2D1_COLOR_F color;
+    if (isLocal) color = D2D1::ColorF(0, 1, 1, 0.8f);
+    else if (isEnemy) color = D2D1::ColorF(1, 0, 0, 0.8f);
+    else color = D2D1::ColorF(0, 1, 0, 0.8f);
     m_brush->SetColor(color);
 
     float height = fabs(footPos.y - headPos.y);
@@ -156,7 +168,7 @@ void ESPRenderer::DrawBox(const Vector2& footPos, const Vector2& headPos,
     m_renderTarget->DrawLine(D2D1::Point2F(right, bottom), D2D1::Point2F(right, bottom - cl), m_brush, t);
 }
 
-void ESPRenderer::DrawName(const std::string& name, const Vector2& headPos) {
+void ESPRenderer::DrawName(const std::string& name, const Vector2& headPos, bool isLocal) {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, nullptr, 0);
     if (wlen <= 0) return;
     std::wstring wname(wlen, 0);
@@ -220,4 +232,22 @@ void ESPRenderer::DrawDistance(float distance, const Vector2& footPos) {
     m_renderTarget->DrawText(wbuf.c_str(), (UINT32)wbuf.size() - 1, m_textFormat,
         D2D1::RectF(footPos.x - 30, footPos.y + 2, footPos.x + 30, footPos.y + 20),
         m_whiteBrush);
+}
+
+void ESPRenderer::DrawStatus(const std::string& text) {
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return;
+    std::wstring wtext(wlen, 0);
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wtext.data(), wlen);
+
+    float cx = (float)m_screenWidth / 2.0f;
+    float cy = (float)m_screenHeight / 2.0f;
+
+    m_blackBrush->SetColor(D2D1::ColorF(0, 0, 0, 0.7f));
+    m_renderTarget->FillRectangle(
+        D2D1::RectF(cx - 180, cy - 20, cx + 180, cy + 20), m_blackBrush);
+
+    m_whiteBrush->SetColor(D2D1::ColorF(0, 1, 1, 1));
+    m_renderTarget->DrawText(wtext.c_str(), (UINT32)wtext.size() - 1, m_textFormat,
+        D2D1::RectF(cx - 175, cy - 18, cx + 175, cy + 18), m_whiteBrush);
 }

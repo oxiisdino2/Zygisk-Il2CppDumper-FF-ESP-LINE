@@ -29,12 +29,27 @@ MemoryReader::~MemoryReader() {
 bool MemoryReader::FindADB() {
     const char* paths[] = {
         "adb",
+        "adb.exe",
+        // Bluestacks 5 variants (common)
         R"(C:\Program Files\BlueStacks_nxt\adb.exe)",
-        R"(C:\Program Files\BlueStacks\adb.exe)",
-        R"(C:\Program Files (x86)\BlueStacks\adb.exe)",
+        R"(C:\Program Files\BlueStacks_nxt\HD-Adb.exe)",
+        R"(C:\Program Files\BlueStacks_msi5\adb.exe)",
+        R"(C:\Program Files\BlueStacks_msi5\HD-Adb.exe)",
         R"(C:\Program Files (x86)\BlueStacks_nxt\adb.exe)",
+        R"(C:\Program Files (x86)\BlueStacks_nxt\HD-Adb.exe)",
+        // Bluestacks 4
+        R"(C:\Program Files\BlueStacks\adb.exe)",
+        R"(C:\Program Files\BlueStacks\HD-Adb.exe)",
+        R"(C:\Program Files (x86)\BlueStacks\adb.exe)",
+        R"(C:\Program Files (x86)\BlueStacks\HD-Adb.exe)",
+        // MSI Emulator
         R"(C:\Program Files\MSI\MsiEmulator\adb.exe)",
         R"(C:\Program Files (x86)\MSI\MsiEmulator\adb.exe)",
+        // User home / AppData
+        R"(C:\ProgramData\BlueStacks_nxt\adb.exe)",
+        R"(C:\ProgramData\BlueStacks_nxt\HD-Adb.exe)",
+        R"(C:\ProgramData\BlueStacks_msi5\adb.exe)",
+        R"(C:\ProgramData\BlueStacks_msi5\HD-Adb.exe)",
     };
     for (auto& p : paths) {
         std::string result = ExecuteADB(std::string("\"") + p + "\" version");

@@ -1,10 +1,3 @@
-// Free Fire ESP Hook Module
-// Compile for ARM64: $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++ \
-//   -shared -fPIC -o libffhook.so hook.cpp -static-libstdc++
-//
-// This module is loaded via Zygisk into com.dts.freefireth
-// It hooks game functions and sends player data to the Windows overlay via socket
-
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
@@ -17,55 +10,30 @@
 #include <dlfcn.h>
 #include <vector>
 #include <string>
+#include <dirent.h>
 
 // ===================== Il2Cpp Structures =====================
-typedef uintptr_t Il2CppObject;
-typedef uintptr_t Il2CppClass;
-typedef uintptr_t MethodInfo;
-
 struct String {
-    Il2CppObject obj;
+    uintptr_t klass;
+    uintptr_t monitor;
     int32_t length;
     uint16_t chars[];
-};
-
-struct Array {
-    Il2CppObject obj;
-    Il2CppObject bounds;
-    int32_t max_length;
-};
-
-struct List {
-    Il2CppObject obj;
-    Array* items;
-    int32_t size;
-    int32_t version;
 };
 
 // Player struct offsets (from dump.cs)
 #define PLAYER_ISDEAD          0x50
 #define PLAYER_TEAMID          0x29C
-#define PLAYER_PLAYERID        0x2A8
 #define PLAYER_NICKNAME        0x2E8
 #define PLAYER_CACHED_TRANSFORM 0x38
-#define TRANSFORM_POSITION     0x38
 #define ENTITY_UNIQUE_ID       0x3C
 
-// ===================== Hooking infrastructure =====================
-// Simple PLT hook - replace GOT entries
-// In production, use a proper hooking library (SandHook, Dobby, etc.)
-
-typedef void* (*orig_CurrentLocalPlayer_t)(const MethodInfo*);
-orig_CurrentLocalPlayer_t orig_CurrentLocalPlayer = nullptr;
-
-// Socket for communication with Windows overlay
 int g_sock_fd = -1;
 pthread_mutex_t g_data_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct PlayerData {
-    float x, y, z;          // position
+    float x, y, z;
     float headX, headY, headZ;
-    char name[64];           // nickname
+    char name[64];
     int teamIndex;
     int curHP, maxHP;
     int curAP;
@@ -75,21 +43,17 @@ struct PlayerData {
 };
 
 std::vector<PlayerData> g_players;
-void* g_localPlayer = nullptr;
+uintptr_t g_libil2cpp_base = 0;
 
 // ===================== Socket Server Thread =====================
 void* socket_thread(void*) {
-    // Use abstract socket (Android local namespace)
-    // ADB can forward: adb forward tcp:38300 localabstract:ff_esp
     const char* sock_name = "ff_esp";
-
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd < 0) return nullptr;
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    // Abstract socket: first byte of sun_path is null
     addr.sun_path[0] = '\0';
     strncpy(addr.sun_path + 1, sock_name, sizeof(addr.sun_path) - 2);
 
@@ -102,31 +66,24 @@ void* socket_thread(void*) {
         g_sock_fd = accept(server_fd, nullptr, nullptr);
         if (g_sock_fd < 0) continue;
 
-        // Client connected - send player data in a loop
         while (true) {
             pthread_mutex_lock(&g_data_mutex);
             int count = (int)g_players.size();
-
-            // Send header: local player address + player count
-            write(g_sock_fd, &g_localPlayer, sizeof(g_localPlayer));
+            uintptr_t localPlayerPtr = 0;
+            write(g_sock_fd, &localPlayerPtr, sizeof(localPlayerPtr));
             write(g_sock_fd, &count, sizeof(count));
-
-            // Send each player's data
             for (int i = 0; i < count; i++) {
                 write(g_sock_fd, &g_players[i], sizeof(PlayerData));
             }
             pthread_mutex_unlock(&g_data_mutex);
-
-            usleep(50000); // 50ms = 20 FPS update
+            usleep(50000);
         }
-
         close(g_sock_fd);
         g_sock_fd = -1;
     }
     return nullptr;
 }
 
-// ===================== Helper function to read Il2Cpp strings =====================
 void read_unity_string(void* str_ptr, char* out, int max_len) {
     if (!str_ptr) { out[0] = 0; return; }
     String* s = (String*)str_ptr;
@@ -138,39 +95,20 @@ void read_unity_string(void* str_ptr, char* out, int max_len) {
     out[len] = 0;
 }
 
-// ===================== Hooked Functions =====================
-// Hook 1: GameFacade.CurrentLocalPlayer - capture local player
-void* hooked_CurrentLocalPlayer(const MethodInfo* method) {
-    void* player = orig_CurrentLocalPlayer(method);
-    if (player) {
-        g_localPlayer = player;
-    }
-    return player;
-}
-
-// ===================== Player Data Collector =====================
 void collect_player_data(void* player, bool isLocal) {
     if (!player) return;
-
-    // Read from libunity.so for Transform
-    // We use direct memory reads since we're in-process
     PlayerData pd = {};
 
-    // Read name
     void** namePtr = (void**)((uintptr_t)player + PLAYER_NICKNAME);
     read_unity_string(*namePtr, pd.name, sizeof(pd.name));
 
-    // Read team ID
     pd.teamIndex = *(int*)((uintptr_t)player + PLAYER_TEAMID);
-
-    // Read dead flag
     pd.isDead = *(bool*)((uintptr_t)player + PLAYER_ISDEAD);
 
-    // Read position via Transform
     void** transformPtr = (void**)((uintptr_t)player + PLAYER_CACHED_TRANSFORM);
     if (transformPtr && *transformPtr) {
         void* transform = *transformPtr;
-        float* pos = (float*)((uintptr_t)transform + TRANSFORM_POSITION);
+        float* pos = (float*)((uintptr_t)transform + 0x38);
         pd.x = pos[0];
         pd.y = pos[1];
         pd.z = pos[2];
@@ -179,66 +117,110 @@ void collect_player_data(void* player, bool isLocal) {
         pd.headZ = pos[2];
     }
 
-    // Read unique ID
     pd.uniqueID = *(uint32_t*)((uintptr_t)player + ENTITY_UNIQUE_ID);
     pd.isLocal = isLocal;
     pd.curHP = 100;
     pd.maxHP = 100;
-
-    // NOTE: For actual HP, you need to call get_CurHP() virtual function.
-    // This requires knowing the vtable slot index and calling through it.
-    // For now we use the vtable offset from dump.cs:
-    // VTable slot 45 = get_CurHP (varies by game version)
 
     pthread_mutex_lock(&g_data_mutex);
     g_players.push_back(pd);
     pthread_mutex_unlock(&g_data_mutex);
 }
 
-// ===================== Hooking =====================
-// Automatically called when the library is loaded
+uintptr_t get_libil2cpp_base() {
+    if (g_libil2cpp_base) return g_libil2cpp_base;
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        if (strstr(line, "libil2cpp.so")) {
+            g_libil2cpp_base = strtoul(line, nullptr, 16);
+            break;
+        }
+    }
+    fclose(maps);
+    return g_libil2cpp_base;
+}
+
+// ===================== Call Il2Cpp Function =====================
+// Call GameFacade.CurrentLocalPlayer (static, no args)
+typedef void* (*getLocalPlayer_t)(const void*);
+getLocalPlayer_t g_getLocalPlayer = nullptr;
+
+void* call_CurrentLocalPlayer() {
+    if (!g_getLocalPlayer) return nullptr;
+    return g_getLocalPlayer(nullptr);
+}
+
+// ===================== VTable Scanner =====================
+void scan_for_players(uintptr_t playerVtable) {
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) return;
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t start, end;
+        char perms[8] = {}, path[256] = {};
+        sscanf(line, "%lx-%lx %s %*lx %*s %*d %[^\n]", &start, &end, perms, path);
+
+        // Only scan anonymous heap regions (rw-p with no path, or [heap])
+        bool isHeap = (perms[0] == 'r' && perms[1] == 'w' &&
+                      (strstr(path, "[heap]") || path[0] == '\0'));
+        if (!isHeap) continue;
+
+        for (uintptr_t addr = start; addr + 16 <= end; addr += 16) {
+            uintptr_t val = *(volatile uintptr_t*)addr;
+            if (val == playerVtable) {
+                void* candidate = (void*)addr;
+                int teamId = *(int*)((uintptr_t)candidate + PLAYER_TEAMID);
+                if (teamId >= 0 && teamId < 100) {
+                    collect_player_data(candidate, false);
+                }
+            }
+        }
+    }
+    fclose(maps);
+}
+
+// ===================== Init =====================
 __attribute__((constructor))
 void init() {
-    // Start socket server in background thread
     pthread_t tid;
     pthread_create(&tid, nullptr, socket_thread, nullptr);
     pthread_detach(tid);
 
-    // Wait a bit for game to initialize
-    sleep(5);
+    sleep(3);
 
-    // Hook GameFacade.CurrentLocalPlayer
-    void* handle = dlopen("libil2cpp.so", RTLD_NOW);
-    if (!handle) return;
+    uintptr_t base = get_libil2cpp_base();
+    if (!base) return;
 
-    void* funcAddr = dlsym(handle, "COW_GameFacade__CurrentLocalPlayer");
-    if (!funcAddr) {
-        // Fallback: find by offset if symbols stripped
-        // Use /proc/self/maps to find libil2cpp.so base
-        FILE* maps = fopen("/proc/self/maps", "r");
-        if (maps) {
-            char line[256];
-            uintptr_t base = 0;
-            while (fgets(line, sizeof(line), maps)) {
-                if (strstr(line, "libil2cpp.so")) {
-                    base = strtoul(line, nullptr, 16);
-                    break;
-                }
-            }
-            fclose(maps);
-            if (base) {
-                funcAddr = (void*)(base + 0x5F52F04); // CurrentLocalPlayer RVA
-            }
+    // Set up function pointers
+    g_getLocalPlayer = (getLocalPlayer_t)(base + 0x5F52F04);
+
+    if (!g_getLocalPlayer) return;
+
+    // Main loop: collect players continuously
+    while (true) {
+        g_players.clear();
+
+        void* localPlayer = call_CurrentLocalPlayer();
+        if (!localPlayer) {
+            sleep(1);
+            continue;
         }
-    }
 
-    if (funcAddr) {
-        // Install hook (simplified - in production use a hook library)
-        orig_CurrentLocalPlayer = (orig_CurrentLocalPlayer_t)funcAddr;
-        // mprotect to make writable, replace first instructions
-        // This is a simplified illustration - real hooking is more complex
-    }
+        // Read vtable from local player
+        uintptr_t playerVtable = *(uintptr_t*)localPlayer;
+        if (!playerVtable) {
+            sleep(1);
+            continue;
+        }
 
-    // Hook player update method to collect all players
-    // In practice, you'd hook Entity update or ReplicationEntity register
+        // Collect local player data
+        collect_player_data(localPlayer, true);
+
+        // Scan heap for other players with same vtable
+        scan_for_players(playerVtable);
+
+        sleep(1);
+    }
 }

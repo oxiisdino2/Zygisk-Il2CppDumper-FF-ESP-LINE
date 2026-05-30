@@ -20,13 +20,14 @@ public:
     bool Initialize(HWND overlayWindow);
     void BeginFrame();
     void EndFrame();
-    void Render(const std::vector<PlayerInfo>& players, const ESPConfig& config);
+    void Render(const std::vector<PlayerInfo>& players, const ESPConfig& config, bool connected);
 
-    void DrawSnapline(const Vector2& footPos, const ESPConfig& config, bool isEnemy);
-    void DrawBox(const Vector2& footPos, const Vector2& headPos, const ESPConfig& config, bool isEnemy);
-    void DrawName(const std::string& name, const Vector2& headPos);
+    void DrawSnapline(const Vector2& footPos, const ESPConfig& config, bool isEnemy, bool isLocal);
+    void DrawBox(const Vector2& footPos, const Vector2& headPos, const ESPConfig& config, bool isEnemy, bool isLocal);
+    void DrawName(const std::string& name, const Vector2& headPos, bool isLocal);
     void DrawHealthBar(const Vector2& footPos, const Vector2& headPos, int curHP, int maxHP);
     void DrawDistance(float distance, const Vector2& footPos);
+    void DrawStatus(const std::string& text);
 
     void SetScreenSize(int w, int h);
 
