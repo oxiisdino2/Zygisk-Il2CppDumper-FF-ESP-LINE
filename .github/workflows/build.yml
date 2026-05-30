@@ -14,45 +14,38 @@ jobs:
       matrix:
         arch: [arm64-v8a, armeabi-v7a, x86, x86_64]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
+      - uses: actions/checkout@v4
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
+        id: setup-ndk
         with:
           ndk-version: r27
-          add-to-path: true
-
-      - name: Map architecture
-        id: arch_map
-        shell: bash
-        run: |
-          case "${{ matrix.arch }}" in
-            arm64-v8a)  TOOLCHAIN=aarch64-linux-android21  ;;
-            armeabi-v7a) TOOLCHAIN=armv7a-linux-androideabi21  ;;
-            x86)        TOOLCHAIN=i686-linux-android21  ;;
-            x86_64)     TOOLCHAIN=x86_64-linux-android21  ;;
-          esac
-          echo "toolchain=$TOOLCHAIN" >> $GITHUB_OUTPUT
+          add-to-path: false
 
       - name: Compile hook.cpp
         shell: bash
         run: |
-          TOOL=${{ steps.arch_map.outputs.toolchain }}
-          ${TOOL}-clang++ \
+          NDK=${{ steps.setup-ndk.outputs.ndk-path }}
+          TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+
+          case "${{ matrix.arch }}" in
+            arm64-v8a)  CC=$TOOLCHAIN/aarch64-linux-android21-clang++  ;;
+            armeabi-v7a) CC=$TOOLCHAIN/armv7a-linux-androideabi21-clang++  ;;
+            x86)        CC=$TOOLCHAIN/i686-linux-android21-clang++  ;;
+            x86_64)     CC=$TOOLCHAIN/x86_64-linux-android21-clang++  ;;
+          esac
+
+          echo "Compiling with: $CC"
+          ls -la $TOOLCHAIN/ 2>&1 | head -20
+
+          $CC \
             -std=c++17 \
             -fvisibility=hidden \
             -fPIC \
             -shared \
             -static-libstdc++ \
             -o libffhook_${{ matrix.arch }}.so \
-            -I FF_ESP_Panel/src \
             FF_ESP_Panel/android/hook.cpp \
             -llog
 
@@ -66,10 +59,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -77,15 +69,12 @@ jobs:
       - name: Package Zygisk module
         shell: bash
         run: |
-          mkdir -p module/META-INF/com/google/android
-          mkdir -p module/zygisk
+          mkdir -p module/META-INF/com/google/android module/zygisk
 
-          # Copy module files
           cp extracted/module.prop module/
           cp extracted/META-INF/com/google/android/update-binary module/META-INF/com/google/android/
           cp extracted/META-INF/com/google/android/updater-script module/META-INF/com/google/android/
 
-          # Copy compiled .so files
           cp artifacts/libffhook_arm64-v8a/libffhook_arm64-v8a.so module/zygisk/arm64-v8a.so
           cp artifacts/libffhook_armeabi-v7a/libffhook_armeabi-v7a.so module/zygisk/armeabi-v7a.so
           cp artifacts/libffhook_x86/libffhook_x86.so module/zygisk/x86.so
@@ -98,12 +87,9 @@ jobs:
           sed -i 's/author=Perfare/author=FF_ESP/' module/module.prop
           sed -i 's/description=.*/description=Free Fire ESP hook module for Bluestacks\/MSI Emulator/' module/module.prop
 
-          # Create zip
-          cd module
-          zip -r ../FF_ESP_Hook_Module.zip *
-          cd ..
+          cd module && zip -r ../FF_ESP_Hook_Module.zip * && cd ..
 
-      - name: Upload final module
+      - name: Upload module
         uses: actions/upload-artifact@v4
         with:
           name: FF_ESP_Hook_Module
