@@ -13,18 +13,20 @@ jobs:
         include:
           - arch: arm64-v8a
             target: aarch64-linux-android21
-          - arch: x86_64
-            target: x86_64-linux-android21
-          - arch: x86
-            target: i686-linux-android21
           - arch: armeabi-v7a
             target: armv7a-linux-androideabi21
+          - arch: x86
+            target: i686-linux-android21
+          - arch: x86_64
+            target: x86_64-linux-android21
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install NDK
+      - name: Get NDK
         shell: bash
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip curl
           cd /tmp
           curl -sLo ndk.zip https://dl.google.com/android/repository/android-ndk-r27-linux.zip
           unzip -q ndk.zip
@@ -33,12 +35,15 @@ jobs:
       - name: Compile hook.cpp
         shell: bash
         run: |
+          set -x
           TOOLCHAIN=${{ env.NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin
           CC=$TOOLCHAIN/${{ matrix.target }}-clang++
           
-          echo "Compiler: $CC"
+          echo "=== Compiler ==="
+          ls -la $TOOLCHAIN/ | grep ${{ matrix.target }}
           $CC --version
           
+          echo "=== Compiling ==="
           $CC \
             -std=c++17 \
             -fvisibility=hidden \
@@ -47,10 +52,18 @@ jobs:
             -static-libstdc++ \
             -o libffhook_${{ matrix.arch }}.so \
             FF_ESP_Panel/android/hook.cpp \
-            -llog
+            -llog \
+            2>&1 | tee compile_output.txt
           
-          echo "=== Output ==="
-          ls -lh libffhook_${{ matrix.arch }}.so
+          echo "=== Exit code: $? ==="
+          ls -lh libffhook_${{ matrix.arch }}.so || true
+
+      - name: Upload compile log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile_log_${{ matrix.arch }}
+          path: compile_output.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -64,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -72,6 +85,7 @@ jobs:
       - name: Package module
         shell: bash
         run: |
+          ls -la artifacts/
           mkdir -p module/META-INF/com/google/android module/zygisk
 
           cp extracted/module.prop module/
@@ -87,7 +101,7 @@ jobs:
           sed -i 's/name=Il2CppDumper/name=FF ESP Hook/' module/module.prop
           sed -i 's/version=v1.2.0/version=v1.0.0/' module/module.prop
           sed -i 's/author=Perfare/author=FF_ESP/' module/module.prop
-          sed -i 's/description=.*/description=FF ESP hook/' module/module.prop
+          sed -i 's/description=.*/description=FF ESP module/' module/module.prop
 
           cd module && zip -r ../FF_ESP_Hook_Module.zip * && cd ..
 
