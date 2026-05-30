@@ -117,7 +117,8 @@ void* socket_thread(void*) {
 }
 
 // Il2Cpp API via dlsym
-void* (*il2cpp_class_from_name)(const char*, const char*) = nullptr;
+// il2cpp_class_from_name(image, namespace, name) — pass nullptr for image to search all
+void* (*il2cpp_class_from_name)(void*, const char*, const char*) = nullptr;
 void* (*il2cpp_class_get_field_from_name)(void*, const char*) = nullptr;
 void  (*il2cpp_field_static_get_value)(void*, void*) = nullptr;
 
@@ -133,7 +134,7 @@ void init_il2cpp_api() {
 void* get_static_field_value(const char* ns, const char* cls, const char* field) {
     if (!il2cpp_class_from_name || !il2cpp_class_get_field_from_name || !il2cpp_field_static_get_value)
         return nullptr;
-    void* klass = il2cpp_class_from_name(ns, cls);
+    void* klass = il2cpp_class_from_name(nullptr, ns, cls);
     if (!klass) return nullptr;
     void* f = il2cpp_class_get_field_from_name(klass, field);
     if (!f) return nullptr;
