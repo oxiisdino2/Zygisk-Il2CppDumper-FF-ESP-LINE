@@ -10,7 +10,7 @@
 #include <dlfcn.h>
 #include <vector>
 #include <string>
-#include <dirent.h>
+
 
 // ===================== Il2Cpp Structures =====================
 struct String {
@@ -181,24 +181,16 @@ void scan_for_players(uintptr_t playerVtable) {
     fclose(maps);
 }
 
-// ===================== Init =====================
-__attribute__((constructor))
-void init() {
-    pthread_t tid;
-    pthread_create(&tid, nullptr, socket_thread, nullptr);
-    pthread_detach(tid);
-
-    sleep(3);
+// ===================== Collector Thread =====================
+void* collector_thread(void*) {
+    sleep(5);
 
     uintptr_t base = get_libil2cpp_base();
-    if (!base) return;
+    if (!base) return nullptr;
 
-    // Set up function pointers
     g_getLocalPlayer = (getLocalPlayer_t)(base + 0x5F52F04);
+    if (!g_getLocalPlayer) return nullptr;
 
-    if (!g_getLocalPlayer) return;
-
-    // Main loop: collect players continuously
     while (true) {
         g_players.clear();
 
@@ -208,19 +200,28 @@ void init() {
             continue;
         }
 
-        // Read vtable from local player
         uintptr_t playerVtable = *(uintptr_t*)localPlayer;
         if (!playerVtable) {
             sleep(1);
             continue;
         }
 
-        // Collect local player data
         collect_player_data(localPlayer, true);
-
-        // Scan heap for other players with same vtable
         scan_for_players(playerVtable);
 
         sleep(1);
     }
+    return nullptr;
+}
+
+// ===================== Init =====================
+__attribute__((constructor))
+void init() {
+    pthread_t tid;
+    pthread_create(&tid, nullptr, socket_thread, nullptr);
+    pthread_detach(tid);
+
+    pthread_t tid2;
+    pthread_create(&tid2, nullptr, collector_thread, nullptr);
+    pthread_detach(tid2);
 }
