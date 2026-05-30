@@ -3,8 +3,6 @@ name: Build Hook Module
 on:
   push:
     branches: [ main ]
-    paths:
-      - 'FF_ESP_Panel/android/**'
   workflow_dispatch:
 
 jobs:
