@@ -6,6 +6,7 @@
 // It hooks game functions and sends player data to the Windows overlay via socket
 
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -78,10 +79,9 @@ void* g_localPlayer = nullptr;
 
 // ===================== Socket Server Thread =====================
 void* socket_thread(void*) {
-    const char* sock_path = "/data/local/tmp/ff_esp.sock";
-
-    // Remove old socket
-    unlink(sock_path);
+    // Use abstract socket (Android local namespace)
+    // ADB can forward: adb forward tcp:38300 localabstract:ff_esp
+    const char* sock_name = "ff_esp";
 
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd < 0) return nullptr;
@@ -89,10 +89,13 @@ void* socket_thread(void*) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    // Abstract socket: first byte of sun_path is null
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, sock_name, sizeof(addr.sun_path) - 2);
 
-    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
-    chmod(sock_path, 0777);
+    unlink(sock_name);
+    bind(server_fd, (struct sockaddr*)&addr,
+         offsetof(struct sockaddr_un, sun_path) + 1 + strlen(sock_name));
     listen(server_fd, 1);
 
     while (true) {
