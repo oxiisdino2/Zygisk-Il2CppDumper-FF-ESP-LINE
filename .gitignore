@@ -1,0 +1,21 @@
+# Large dump files (binary game data)
+DUMP FF/
+FINAL DUMP FF/
+Il2CppDumper-win-v6.7.46/
+dump.cs
+zygisk-il2cppdumper*.zip
+extracted/*.so
+
+# Build output
+FF_ESP_Panel/bin/
+FF_ESP_Panel/build/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.log
+
+# IDE
+.vs/
+*.suo
+*.user
