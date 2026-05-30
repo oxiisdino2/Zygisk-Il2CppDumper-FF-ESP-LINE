@@ -11,7 +11,6 @@
 #include <vector>
 #include <string>
 
-// Player field offsets (from dump.cs)
 #define PLAYER_ISDEAD          0x50
 #define PLAYER_TEAMID          0x29C
 #define PLAYER_NICKNAME        0x2E8
@@ -53,52 +52,27 @@ void read_unity_string(void* str_ptr, char* out, int max_len) {
     out[len] = 0;
 }
 
-// Check if address is in libil2cpp.so data section
-bool is_in_libil2cpp(uintptr_t addr) {
-    static uintptr_t lib_start = 0, lib_end = 0;
-    if (!lib_start) {
-        FILE* maps = fopen("/proc/self/maps", "r");
-        if (maps) {
-            char line[512];
-            while (fgets(line, sizeof(line), maps)) {
-                if (strstr(line, "libil2cpp.so")) {
-                    uintptr_t s, e;
-                    char perms[8];
-                    sscanf(line, "%lx-%lx %s", &s, &e, perms);
-                    if (!lib_start) lib_start = s;
-                    lib_end = e;
-                }
-            }
-            fclose(maps);
-        }
-    }
-    return addr >= lib_start && addr < lib_end;
-}
+void try_read_player(void* obj) {
+    if (!obj) return;
 
-// Read a player's fields and add to list
-bool try_read_player(void* obj, bool isLocal) {
-    if (!obj) return false;
-
-    // Validate player by checking teamId field
+    // Validate: teamId must be 0-99
     int teamId = *(int*)((uintptr_t)obj + PLAYER_TEAMID);
-    if (teamId < 0 || teamId > 99) return false;
+    if (teamId < 0 || teamId > 99) return;
 
-    // Validate isDead is a bool (0 or 1)
+    // Validate: isDead must be 0 or 1
     uint8_t dead = *(uint8_t*)((uintptr_t)obj + PLAYER_ISDEAD);
-    if (dead > 1) return false;
+    if (dead > 1) return;
 
-    // Check if CachedTransform pointer is in valid memory
+    // Validate: CachedTransform should be a valid pointer
     void** transformPtr = (void**)((uintptr_t)obj + PLAYER_CACHED_TRANSFORM);
-    if (!transformPtr || !*transformPtr) return false;
+    if (!transformPtr || !*transformPtr) return;
     uintptr_t tf = (uintptr_t)*transformPtr;
-    if (tf < 0x10000 || (tf & 7) != 0) return false;
+    if (tf < 0x10000 || (tf & 7) != 0) return;
 
-    // All checks passed - this is likely a Player object
+    // Read name
     PlayerData pd = {};
-
     void** namePtr = (void**)((uintptr_t)obj + PLAYER_NICKNAME);
     read_unity_string(*namePtr, pd.name, sizeof(pd.name));
-
     pd.teamIndex = teamId;
     pd.isDead = (dead != 0);
 
@@ -113,21 +87,20 @@ bool try_read_player(void* obj, bool isLocal) {
     pd.headZ = pos[2];
 
     pd.uniqueID = *(uint32_t*)((uintptr_t)obj + ENTITY_UNIQUE_ID);
-    pd.isLocal = isLocal;
+    pd.isLocal = false;
     pd.curHP = 100;
     pd.maxHP = 100;
 
     pthread_mutex_lock(&g_data_mutex);
-    // Deduplicate by address
+    // Deduplicate
     for (auto& existing : g_players) {
         if (existing.uniqueID == pd.uniqueID) {
             pthread_mutex_unlock(&g_data_mutex);
-            return true;
+            return;
         }
     }
     g_players.push_back(pd);
     pthread_mutex_unlock(&g_data_mutex);
-    return true;
 }
 
 // ===================== Socket Server =====================
@@ -179,25 +152,19 @@ void scan_for_players() {
     char line[512];
     while (fgets(line, sizeof(line), maps)) {
         uintptr_t start, end;
-        char perms[8] = {}, path[256] = {};
-        sscanf(line, "%lx-%lx %s %*lx %*s %*d %[^\n]", &start, &end, perms, path);
+        char perms[8] = {};
+        sscanf(line, "%lx-%lx %s", &start, &end, perms);
 
-        // Only scan readable writable regions (heap, BSS, data)
-        bool scan = (perms[0] == 'r' && perms[1] == 'w' &&
-                     perms[2] != 'x');
-        if (!scan) continue;
+        // Only scan writable data regions (not executable)
+        if (perms[0] != 'r' || perms[1] != 'w') continue;
+        if (perms[2] == 'x') continue;
 
-        // Skip guard pages and small regions
-        if (end - start < 4096) continue;
+        // Skip very large regions (video memory, etc.)
+        size_t size = end - start;
+        if (size > 100 * 1024 * 1024) continue;
 
-        for (uintptr_t addr = start; addr + 64 < end; addr += 16) {
-            // Potential klass pointer (first 8 bytes of object)
-            uintptr_t klass = *(uintptr_t*)addr;
-            if (!is_in_libil2cpp(klass)) continue;
-            if (klass & 7) continue;  // must be 8-byte aligned
-
-            void* obj = (void*)addr;
-            try_read_player(obj, false);
+        for (uintptr_t addr = start; addr + 0x300 < end; addr += 16) {
+            try_read_player((void*)addr);
         }
     }
     fclose(maps);
@@ -205,15 +172,17 @@ void scan_for_players() {
 
 // ===================== Collector Thread =====================
 void* collector_thread(void*) {
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 600; i++) {
         scan_for_players();
-        if (!g_players.empty()) break;
+        if (!g_players.empty()) {
+            sleep(3);
+            continue;
+        }
         sleep(1);
     }
     return nullptr;
 }
 
-// ===================== Init =====================
 __attribute__((constructor))
 void init() {
     pthread_t tid;
