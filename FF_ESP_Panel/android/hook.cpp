@@ -8,9 +8,14 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dlfcn.h>
+#include <android/log.h>
+#include <signal.h>
 #include <vector>
 #include <string>
 
+#define LOG_TAG "FF_ESP"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ===================== Il2Cpp Structures =====================
 struct String {
@@ -20,7 +25,7 @@ struct String {
     uint16_t chars[];
 };
 
-// Player struct offsets (from dump.cs)
+// Player object field offsets (from dump.cs)
 #define PLAYER_ISDEAD          0x50
 #define PLAYER_TEAMID          0x29C
 #define PLAYER_NICKNAME        0x2E8
@@ -45,11 +50,23 @@ struct PlayerData {
 std::vector<PlayerData> g_players;
 uintptr_t g_libil2cpp_base = 0;
 
+// Il2Cpp API function pointers
+typedef void* (*class_from_name_t)(const char*, const char*);
+class_from_name_t il2cpp_class_from_name = nullptr;
+
+void* get_api_func(const char* name) {
+    void* sym = dlsym(RTLD_DEFAULT, name);
+    if (sym) LOGI("Found API: %s = %p", name, sym);
+    else LOGE("API not found: %s", name);
+    return sym;
+}
+
 // ===================== Socket Server Thread =====================
 void* socket_thread(void*) {
+    LOGI("socket_thread starting");
     const char* sock_name = "ff_esp";
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_fd < 0) return nullptr;
+    if (server_fd < 0) { LOGE("socket failed"); return nullptr; }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -61,16 +78,18 @@ void* socket_thread(void*) {
     bind(server_fd, (struct sockaddr*)&addr,
          offsetof(struct sockaddr_un, sun_path) + 1 + strlen(sock_name));
     listen(server_fd, 1);
+    LOGI("socket listening");
 
     while (true) {
         g_sock_fd = accept(server_fd, nullptr, nullptr);
         if (g_sock_fd < 0) continue;
+        LOGI("client connected");
 
         while (true) {
             pthread_mutex_lock(&g_data_mutex);
             int count = (int)g_players.size();
-            uintptr_t localPlayerPtr = 0;
-            write(g_sock_fd, &localPlayerPtr, sizeof(localPlayerPtr));
+            uintptr_t dummy = 0;
+            write(g_sock_fd, &dummy, sizeof(dummy));
             write(g_sock_fd, &count, sizeof(count));
             for (int i = 0; i < count; i++) {
                 write(g_sock_fd, &g_players[i], sizeof(PlayerData));
@@ -122,6 +141,9 @@ void collect_player_data(void* player, bool isLocal) {
     pd.curHP = 100;
     pd.maxHP = 100;
 
+    LOGI("Player: %s team=%d dead=%d pos=(%.1f,%.1f,%.1f) local=%d",
+         pd.name, pd.teamIndex, pd.isDead, pd.x, pd.y, pd.z, isLocal);
+
     pthread_mutex_lock(&g_data_mutex);
     g_players.push_back(pd);
     pthread_mutex_unlock(&g_data_mutex);
@@ -139,21 +161,47 @@ uintptr_t get_libil2cpp_base() {
         }
     }
     fclose(maps);
+    LOGI("libil2cpp base: 0x%lx", g_libil2cpp_base);
     return g_libil2cpp_base;
 }
 
-// ===================== Call Il2Cpp Function =====================
-// Call GameFacade.CurrentLocalPlayer (static, no args)
-typedef void* (*getLocalPlayer_t)(const void*);
-getLocalPlayer_t g_getLocalPlayer = nullptr;
+// ===================== Find Player by scanning through Il2Cpp =====================
+// Try to get the local player by calling the function with dlsym'd reference
+void find_all_players() {
+    // Try 1: Direct function call via RVA
+    uintptr_t base = get_libil2cpp_base();
+    if (!base) return;
 
-void* call_CurrentLocalPlayer() {
-    if (!g_getLocalPlayer) return nullptr;
-    return g_getLocalPlayer(nullptr);
-}
+    typedef void* (*currentLocalPlayer_t)(const void*);
+    currentLocalPlayer_t getLocalPlayer = (currentLocalPlayer_t)(base + 0x5F52F04);
+    
+    // Create a minimal fake "MethodInfo" — first field is just the function ptr
+    // Some Il2Cpp versions need a valid MethodInfo
+    struct FakeMethodInfo {
+        void* methodPtr;
+        void* dummy;
+    };
+    FakeMethodInfo fakeMI = { (void*)getLocalPlayer, nullptr };
+    
+    // Try with fake MethodInfo
+    void* localPlayer = getLocalPlayer(&fakeMI);
+    if (!localPlayer) {
+        // Try with null (some versions work this way)
+        localPlayer = getLocalPlayer(nullptr);
+    }
+    
+    if (!localPlayer) {
+        LOGI("getLocalPlayer returned null");
+        return;
+    }
 
-// ===================== VTable Scanner =====================
-void scan_for_players(uintptr_t playerVtable) {
+    LOGI("Local player found: %p", localPlayer);
+    collect_player_data(localPlayer, true);
+
+    // Scan heap for other players with same klass pointer
+    uintptr_t playerKlass = *(uintptr_t*)localPlayer;
+    LOGI("Player klass: 0x%lx", playerKlass);
+
     FILE* maps = fopen("/proc/self/maps", "r");
     if (!maps) return;
     char line[512];
@@ -162,14 +210,13 @@ void scan_for_players(uintptr_t playerVtable) {
         char perms[8] = {}, path[256] = {};
         sscanf(line, "%lx-%lx %s %*lx %*s %*d %[^\n]", &start, &end, perms, path);
 
-        // Only scan anonymous heap regions (rw-p with no path, or [heap])
         bool isHeap = (perms[0] == 'r' && perms[1] == 'w' &&
                       (strstr(path, "[heap]") || path[0] == '\0'));
         if (!isHeap) continue;
 
         for (uintptr_t addr = start; addr + 16 <= end; addr += 16) {
-            uintptr_t val = *(volatile uintptr_t*)addr;
-            if (val == playerVtable) {
+            uintptr_t val = *(uintptr_t*)addr;
+            if (val == playerKlass && addr != (uintptr_t)localPlayer) {
                 void* candidate = (void*)addr;
                 int teamId = *(int*)((uintptr_t)candidate + PLAYER_TEAMID);
                 if (teamId >= 0 && teamId < 100) {
@@ -183,33 +230,23 @@ void scan_for_players(uintptr_t playerVtable) {
 
 // ===================== Collector Thread =====================
 void* collector_thread(void*) {
-    sleep(5);
+    LOGI("collector_thread started, waiting for game...");
+    sleep(10);
 
-    uintptr_t base = get_libil2cpp_base();
-    if (!base) return nullptr;
-
-    g_getLocalPlayer = (getLocalPlayer_t)(base + 0x5F52F04);
-    if (!g_getLocalPlayer) return nullptr;
+    // Initialize Il2Cpp API
+    il2cpp_class_from_name = (class_from_name_t)get_api_func("il2cpp_class_from_name");
 
     while (true) {
         g_players.clear();
+        find_all_players();
 
-        void* localPlayer = call_CurrentLocalPlayer();
-        if (!localPlayer) {
-            sleep(1);
-            continue;
-        }
+        int count = 0;
+        pthread_mutex_lock(&g_data_mutex);
+        count = g_players.size();
+        pthread_mutex_unlock(&g_data_mutex);
+        LOGI("Found %d players", count);
 
-        uintptr_t playerVtable = *(uintptr_t*)localPlayer;
-        if (!playerVtable) {
-            sleep(1);
-            continue;
-        }
-
-        collect_player_data(localPlayer, true);
-        scan_for_players(playerVtable);
-
-        sleep(1);
+        sleep(2);
     }
     return nullptr;
 }
@@ -217,6 +254,8 @@ void* collector_thread(void*) {
 // ===================== Init =====================
 __attribute__((constructor))
 void init() {
+    LOGI("Module loaded!");
+
     pthread_t tid;
     pthread_create(&tid, nullptr, socket_thread, nullptr);
     pthread_detach(tid);
@@ -224,4 +263,6 @@ void init() {
     pthread_t tid2;
     pthread_create(&tid2, nullptr, collector_thread, nullptr);
     pthread_detach(tid2);
+
+    LOGI("Module init complete");
 }
